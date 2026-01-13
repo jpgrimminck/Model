@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>VAD RMS – Tiempo Real</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #151824;
+      --text: #e9e9ef;
+      --muted: #9aa3b2;
+      --ok: #19c37d;
+      --warn: #ffcc00;
+      --bad: #ff4d4d;
+      --border: rgba(255,255,255,.08);
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    h1 {
+      font-size: 20px;
+      margin: 0 0 12px 0;
+      letter-spacing: 0.2px;
+    }
+
+    p {
+      margin: 0 0 16px 0;
+      color: var(--muted);
+      line-height: 1.35;
+      max-width: 820px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin: 14px 0 18px 0;
+    }
+
+    button {
+      padding: 10px 14px;
+      font-size: 15px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #1b2030;
+      color: var(--text);
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.08); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      max-width: 820px;
+    }
+
+    .state {
+      font-size: 28px;
+      font-weight: 800;
+      margin-bottom: 8px;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    @media (min-width: 640px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.02);
+    }
+
+    .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .value {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .barWrap {
+      margin-top: 10px;
+      height: 10px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .bar {
+      height: 100%;
+      width: 0%;
+      background: var(--ok);
+      transition: width 80ms linear;
+    }
+
+    .hint {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.03);
+    }
+  </style>
+</head>
+
+<body>
+  <h1>VAD RMS – Tiempo Real</h1>
+  <p>
+    Detector mínimo de actividad usando RMS + suavizado + histéresis.
+    Sirve para probar latencia, estabilidad y gatillos de reglas sin “IA mágica” inventando cosas.
+  </p>
+
+  <div class="row">
+    <button id="toggle">Start</button>
+    <span class="pill" id="perm">Mic: sin permiso</span>
+    <span class="pill" id="status">Audio: detenido</span>
+  </div>
+
+  <div class="panel">
+    <div class="state" id="state">STATE: -</div>
+
+    <div class="barWrap" title="Nivel relativo (RMS suavizado)">
+      <div class="bar" id="bar"></div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">RMS (instantáneo)</div>
+        <div class="value mono" id="rms">-</div>
+      </div>
+
+      <div class="card">
+        <div class="label">RMS (suavizado)</div>
+        <div class="value mono" id="rmsSmooth">-</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Umbrales</div>
+        <div class="value mono" id="thr">-</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Parámetros</div>
+        <div class="value mono" id="params">-</div>
+      </div>
+    </div>
+
+    <div class="hint mono" id="hint">
+      Tips:
+      - Si parpadea, sube SMOOTHING o aumenta histéresis (THRESH_ON - THRESH_OFF).
+      - Si nunca detecta, baja THRESH_ON.
+      - Si siempre está ACTIVE, sube THRESH_ON o desactiva autoGainControl en getUserMedia.
+    </div>
+  </div>
+
+  <script>
+    // =========================
+    // Config: “el modelo”
+    // =========================
+    const CONFIG = {
+      THRESH_ON:  0.025, // activa si rmsSmooth > esto
+      THRESH_OFF: 0.018, // desactiva si rmsSmooth < esto
+      SMOOTHING:  0.85,  // 0..1 (alto = más estable, más lento)
+      FFT_SIZE:   2048,  // tamaño del buffer
+      BAR_SCALE:  0.15   // escala visual para la barra (solo UI)
+    };
+
+    // =========================
+    // Estado interno
+    // =========================
+    let audioCtx = null;
+    let analyser = null;
+    let data = null;
+    let rafId = null;
+    let stream = null;
+
+    let running = false;
+    let isActive = false;
+    let rmsSmooth = 0;
+
+    // =========================
+    // UI
+    // =========================
+    const elToggle = document.getElementById("toggle");
+    const elState = document.getElementById("state");
+    const elRms = document.getElementById("rms");
+    const elRmsSmooth = document.getElementById("rmsSmooth");
+    const elThr = document.getElementById("thr");
+    const elParams = document.getElementById("params");
+    const elBar = document.getElementById("bar");
+    const elPerm = document.getElementById("perm");
+    const elStatus = document.getElementById("status");
+
+    function computeRMS(buffer) {
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i++) {
+        const v = buffer[i];
+        sum += v * v;
+      }
+      return Math.sqrt(sum / buffer.length);
+    }
+
+    function setStateUI(active) {
+      if (active) {
+        elState.textContent = "STATE: ACTIVE";
+        elState.style.color = getComputedStyle(document.documentElement).getPropertyValue("--ok");
+      } else {
+        elState.textContent = "STATE: SILENCE";
+        elState.style.color = getComputedStyle(document.documentElement).getPropertyValue("--muted");
+      }
+    }
+
+    function updateStaticUI() {
+      elThr.textContent =
+        `THRESH_ON:  ${CONFIG.THRESH_ON}\n` +
+        `THRESH_OFF: ${CONFIG.THRESH_OFF}`;
+
+      elParams.textContent =
+        `SMOOTHING: ${CONFIG.SMOOTHING}\n` +
+        `FFT_SIZE:  ${CONFIG.FFT_SIZE}`;
+    }
+
+    function updateBar(val) {
+      // val: rmsSmooth, escala solo para UI
+      const pct = Math.max(0, Math.min(100, (val / CONFIG.BAR_SCALE) * 100));
+      elBar.style.width = pct.toFixed(1) + "%";
+
+      // color según cercanía a umbral
+      const root = document.documentElement;
+      if (val > CONFIG.THRESH_ON) elBar.style.background = getComputedStyle(root).getPropertyValue("--ok");
+      else if (val > CONFIG.THRESH_OFF) elBar.style.background = getComputedStyle(root).getPropertyValue("--warn");
+      else elBar.style.background = "rgba(255,255,255,0.25)";
+    }
+
+    async function start() {
+      // Pide mic
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      elPerm.textContent = "Mic: con permiso";
+      elPerm.style.color = getComputedStyle(document.documentElement).getPropertyValue("--ok");
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaStreamSource(stream);
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = CONFIG.FFT_SIZE;
+
+      src.connect(analyser);
+      data = new Float32Array(analyser.fftSize);
+
+      running = true;
+      elStatus.textContent = "Audio: corriendo";
+      loop();
+    }
+
+    function stop() {
+      running = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+
+      // Detener stream
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+
+      if (audioCtx) {
+        audioCtx.close();
+        audioCtx = null;
+      }
+
+      analyser = null;
+      data = null;
+
+      isActive = false;
+      rmsSmooth = 0;
+
+      elStatus.textContent = "Audio: detenido";
+      elState.textContent = "STATE: -";
+      elState.style.color = "";
+      elRms.textContent = "-";
+      elRmsSmooth.textContent = "-";
+      elBar.style.width = "0%";
+      elBar.style.background = "rgba(255,255,255,0.25)";
+    }
+
+    function loop() {
+      analyser.getFloatTimeDomainData(data);
+
+      const rms = computeRMS(data);
+      rmsSmooth = CONFIG.SMOOTHING * rmsSmooth + (1 - CONFIG.SMOOTHING) * rms;
+
+      // Histéresis: evita parpadeo
+      if (!isActive && rmsSmooth > CONFIG.THRESH_ON) isActive = true;
+      if (isActive && rmsSmooth < CONFIG.THRESH_OFF) isActive = false;
+
+      setStateUI(isActive);
+
+      elRms.textContent = rms.toFixed(6);
+      elRmsSmooth.textContent = rmsSmooth.toFixed(6);
+
+      updateBar(rmsSmooth);
+
+      if (running) rafId = requestAnimationFrame(loop);
+    }
+
+    // Init
+    updateStaticUI();
+
+    elToggle.addEventListener("click", async () => {
+      try {
+        if (!running) {
+          elToggle.textContent = "Stop";
+          await start();
+        } else {
+          elToggle.textContent = "Start";
+          stop();
+        }
+      } catch (err) {
+        // permisos o errores típicos
+        elToggle.textContent = "Start";
+        elPerm.textContent = "Mic: sin permiso";
+        elPerm.style.color = getComputedStyle(document.documentElement).getPropertyValue("--bad");
+        elStatus.textContent = "Audio: error";
+        console.error(err);
+        stop();
+      }
+    });
+  </script>
+</body>
+</html>
